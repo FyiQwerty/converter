@@ -64,7 +64,7 @@ DOWNLOAD_EXPIRY_MINUTES = 2
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', os.urandom(32)) # Increased length
 
 # Gemini Model to use
-GEMINI_MODEL_NAME="gemini-1.5-flash-latest" # "gemini-1.5-flash" is now the specific model alias
+GEMINI_MODEL_NAME="gemini-2.0-flash-lite" # "gemini-1.5-flash" is now the specific model alias
 
 # API Call Settings
 GEMINI_API_TIMEOUT = 600 # 10 minutes timeout for generate_content call
