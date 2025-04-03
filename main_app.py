@@ -74,9 +74,9 @@ GEMINI_RETRY_DELAY_BASE = 7 # Base delay in seconds for retries
 # --- Rate Limiting Configuration ---
 # Strict limit: 20 requests per minute (60 seconds)
 RATE_LIMIT_REQUESTS = 29
-RATE_LIMIT_WINDOW_SECONDS = 62
+RATE_LIMIT_WINDOW_SECONDS = 60
 # Wait time if limit is exceeded: 1 minute 2 seconds = 62 seconds
-RATE_LIMIT_WAIT_SECONDS = 62
+RATE_LIMIT_WAIT_SECONDS = 25
 
 # --- Global State (Use cautiously) ---
 tasks = {} # Dictionary to store task progress and metadata. Key: task_id
