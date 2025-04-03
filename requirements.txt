@@ -1,0 +1,5 @@
+Flask
+google-generativeai
+pypdf2
+Werkzeug
+gunicorn
