@@ -8,7 +8,7 @@ import logging
 import random
 import collections # Added for deque
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, wait, ALL_COMPLETED
 from functools import wraps
 from flask import (
     Flask, request, redirect, url_for, render_template_string,
@@ -45,7 +45,6 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 APP_PASSWORD = os.environ.get('APP_PASSWORD') # Password to access the app
 
 # Base directory for temporary files within the application context
-# Using '/tmp' is often better in containerized environments like Render
 BASE_TEMP_DIR = os.environ.get('TEMP_DIR', '/tmp/pdf_transcriber_temp')
 UPLOAD_FOLDER = os.path.join(BASE_TEMP_DIR, 'uploads')
 OUTPUT_FOLDER = os.path.join(BASE_TEMP_DIR, 'outputs')
@@ -53,41 +52,39 @@ OUTPUT_FOLDER = os.path.join(BASE_TEMP_DIR, 'outputs')
 MAX_CONTENT_LENGTH = 200 * 1024 * 1024
 ALLOWED_EXTENSIONS = {'pdf'}
 # Max pages per PDF chunk sent to Gemini
-MAX_PAGES_PER_CHUNK = 5
-# Max concurrent requests *initiating* to Gemini API (Semaphore limit)
-# The rate limiter will further constrain the *actual* calls per minute.
-MAX_CONCURRENT_REQUESTS = 29 # Keep this for concurrency control, rate limit is separate
+MAX_PAGES_PER_CHUNK = 25
+# Max concurrent *workers* processing chunks (adjust based on system resources)
+# This limits how many chunks are processed *in parallel*.
+# The Rate Limiter controls the API call *rate* across these workers.
+MAX_CONCURRENT_WORKERS = 10 # Example: Limit simultaneous processing threads
 # Time in minutes the download link remains active
 DOWNLOAD_EXPIRY_MINUTES = 2
 # Secret key for Flask sessions (important for security)
-# In a real deployment, set this via environment variable
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', os.urandom(32)) # Increased length
 
 # Gemini Model to use
-GEMINI_MODEL_NAME="gemini-2.0-flash-lite-001" 
+GEMINI_MODEL_NAME="gemini-2.0-flash-thinking-exp-01-21"
 
 # API Call Settings
 GEMINI_API_TIMEOUT = 600 # 10 minutes timeout for generate_content call
-GEMINI_MAX_RETRIES = 10 # Max retries for transient API errors
-GEMINI_RETRY_DELAY_BASE = 7 # Base delay in seconds for retries
+GEMINI_MAX_RETRIES = 10 # Max retries for *transient* API errors per chunk
+GEMINI_RETRY_DELAY_BASE = 7 # Base delay in seconds for retries (exponential backoff)
+GEMINI_UPLOAD_RETRIES = 3 # Retries for the initial chunk upload
+GEMINI_UPLOAD_RETRY_DELAY = 5 # Delay for upload retries
 
 # --- Rate Limiting Configuration ---
-# Strict limit: 20 requests per minute (60 seconds)
-RATE_LIMIT_REQUESTS = 29
+# Strict limit: 29 requests per 60 seconds
+RATE_LIMIT_REQUESTS = 10
 RATE_LIMIT_WINDOW_SECONDS = 60
-# Wait time if limit is exceeded: 1 minute 2 seconds = 62 seconds
-RATE_LIMIT_WAIT_SECONDS = 25
+RATE_LIMIT_SAFETY_MARGIN = 0.1 # Add small buffer (100ms) to calculated wait times
 
 # --- Global State (Use cautiously) ---
 tasks = {} # Dictionary to store task progress and metadata. Key: task_id
 tasks_lock = threading.Lock() # Lock for thread-safe access to tasks dict
-# Semaphore to limit concurrent Gemini API *initiation* attempts
-gemini_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 # Rate Limiter State (Thread-safe)
 rate_limit_lock = threading.Lock()
 request_timestamps = collections.deque() # Stores time.monotonic() of recent requests
-rate_limit_wait_until = 0.0 # Timestamp (monotonic) until which requests should wait
 
 # --- Flask App Initialization ---
 app = Flask(__name__)
@@ -190,15 +187,20 @@ def update_task_status(task_id, status=None, processed_increment=0, total_chunks
         if task_id_str in tasks:
             task = tasks[task_id_str]
             if status:
-                task['status'] = status
+                # Prevent overwriting a final error status with a later, less specific status
+                if not task.get('error') or "error" in status.lower() or status == "Completed":
+                     task['status'] = status
             if processed_increment > 0:
-                task['processed_chunks'] += processed_increment
+                task['processed_chunks'] = min(task.get('processed_chunks', 0) + processed_increment, task.get('total_chunks', float('inf')))
             if total_chunks is not None:
                 task['total_chunks'] = total_chunks
             if error_message:
                 task['error'] = True
-                # Prepend error to status, don't overwrite potentially useful last state
-                task['status'] = f"Error: {error_message} (Last status: {task.get('status', 'N/A')})"
+                # Prepend error to status, don't overwrite potentially useful last state like 'Compiling Results'
+                # Only set if status isn't already showing an error more specific.
+                current_status = task.get('status', 'N/A')
+                if "error" not in current_status.lower():
+                     task['status'] = f"Error: {error_message} (Last status: {current_status})"
                 app.logger.error(f"Task {task_id_str}: Error updated - {error_message}")
             if output_filename:
                  task['output_filename'] = secure_filename(output_filename) # Ensure safe name
@@ -220,42 +222,38 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- Rate Limiter Function ---
+# --- Rate Limiter Function (Strict, Dynamic Wait) ---
 def wait_for_rate_limit():
     """
-    Checks if a request can proceed based on the rate limit.
-    If the limit is hit, waits for the specified duration.
-    Returns True if the request can proceed immediately, False if it waited.
+    Checks if a request can proceed based on the rate limit (requests/window).
+    If the limit is hit, waits dynamically until the oldest request expires.
+    Returns True when the request can proceed.
     """
-    global rate_limit_wait_until # Allow modification of the global variable
-
     while True: # Loop until the request is allowed
         with rate_limit_lock:
             current_time = time.monotonic()
 
-            # Check if we are currently in a forced wait period
-            if current_time < rate_limit_wait_until:
-                sleep_duration = rate_limit_wait_until - current_time
-                app.logger.warning(f"Rate limit enforced. Waiting for {sleep_duration:.2f} seconds...")
-                # Release lock before sleeping
-            else:
-                # Remove timestamps older than the window
-                while request_timestamps and request_timestamps[0] <= current_time - RATE_LIMIT_WINDOW_SECONDS:
-                    request_timestamps.popleft()
+            # Remove timestamps older than the window
+            while request_timestamps and request_timestamps[0] <= current_time - RATE_LIMIT_WINDOW_SECONDS:
+                request_timestamps.popleft()
 
-                # Check if limit is exceeded
-                if len(request_timestamps) < RATE_LIMIT_REQUESTS:
-                    # Allowed: record timestamp and proceed
-                    request_timestamps.append(current_time)
-                    app.logger.debug(f"Rate limit check passed. Request count: {len(request_timestamps)}/{RATE_LIMIT_REQUESTS}")
-                    return True # Allowed to proceed immediately
-                else:
-                    # Limit hit: set the wait period and log
-                    rate_limit_wait_until = current_time + RATE_LIMIT_WAIT_SECONDS
-                    sleep_duration = RATE_LIMIT_WAIT_SECONDS
-                    app.logger.warning(f"Rate limit ({RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW_SECONDS}s) exceeded. "
-                                       f"Waiting for {RATE_LIMIT_WAIT_SECONDS} seconds.")
-                    # Release lock before sleeping
+            # Check if limit is exceeded
+            if len(request_timestamps) < RATE_LIMIT_REQUESTS:
+                # Allowed: record timestamp and proceed
+                request_timestamps.append(current_time)
+                app.logger.debug(f"Rate limit check passed. Request count: {len(request_timestamps)}/{RATE_LIMIT_REQUESTS}")
+                return True # Allowed to proceed immediately
+            else:
+                # Limit hit: Calculate dynamic wait time
+                oldest_timestamp = request_timestamps[0]
+                time_until_oldest_expires = (oldest_timestamp + RATE_LIMIT_WINDOW_SECONDS) - current_time
+                sleep_duration = max(0, time_until_oldest_expires) + RATE_LIMIT_SAFETY_MARGIN # Add buffer
+
+                app.logger.warning(
+                    f"Rate limit ({RATE_LIMIT_REQUESTS}/{RATE_LIMIT_WINDOW_SECONDS}s) hit. "
+                    f"Waiting for {sleep_duration:.2f} seconds (until oldest request expires)."
+                )
+                # Release lock before sleeping
 
         # Sleep outside the lock
         time.sleep(sleep_duration)
@@ -265,171 +263,221 @@ def wait_for_rate_limit():
 # --- Enhanced PDF Chunk Processing ---
 def process_pdf_chunk(chunk_path, task_id, chunk_index, total_chunks):
     """
-    Processes a single PDF chunk using the Gemini API with retries and rate limiting.
-    Executed by worker threads. Acquires semaphore before running.
+    Processes a single PDF chunk using the Gemini API with robust retries and rate limiting.
+    Executed by worker threads. Returns the chunk index and transcribed text,
+    or raises an exception if processing ultimately fails.
     """
     thread_name = threading.current_thread().name
     log_prefix = f"Task {task_id} Chunk {chunk_index + 1}/{total_chunks} [{thread_name}]"
+    gemini_file_name = None
+    local_chunk_deleted = False
+    gemini_file_deleted = False
 
-    with gemini_semaphore: # Acquire semaphore for concurrency control
-        app.logger.info(f"{log_prefix}: Acquired semaphore.")
-        gemini_file_name = None
-        local_chunk_deleted = False
-        gemini_file_deleted = False
+    try:
+        # --- Model Initialization (uses globally configured API key) ---
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
 
-        try:
-            # --- Model Initialization (uses globally configured API key) ---
-            model = genai.GenerativeModel(model_name=GEMINI_MODEL_NAME)
-
-            # --- Upload file chunk to Gemini ---
-            app.logger.info(f"{log_prefix}: Uploading chunk {os.path.basename(chunk_path)} to Gemini.")
-            # Note: Upload itself might have rate limits, but we're limiting the 'generate_content' call
+        # --- Upload file chunk to Gemini with Retries ---
+        app.logger.info(f"{log_prefix}: Uploading chunk {os.path.basename(chunk_path)} to Gemini.")
+        pdf_file_ref = None
+        upload_attempts = 0
+        while upload_attempts < GEMINI_UPLOAD_RETRIES:
+            upload_attempts += 1
             try:
+                update_task_status(task_id, status=f"Uploading Chunk {chunk_index + 1}/{total_chunks} (Attempt {upload_attempts})")
                 pdf_file_ref = genai.upload_file(path=chunk_path, display_name=f"task_{task_id}_chunk_{chunk_index + 1}")
                 gemini_file_name = pdf_file_ref.name
-                app.logger.info(f"{log_prefix}: Uploaded as Gemini file: {gemini_file_name}")
+                app.logger.info(f"{log_prefix}: Uploaded as Gemini file: {gemini_file_name} on attempt {upload_attempts}")
+                break # Success
             except (google_exceptions.GoogleAPIError, Exception) as upload_err:
-                app.logger.error(f"{log_prefix}: Gemini file upload failed: {upload_err}", exc_info=True)
-                raise ConnectionError(f"Failed to upload chunk {chunk_index + 1} to Gemini: {upload_err}") from upload_err
+                app.logger.warning(f"{log_prefix}: Gemini file upload failed (Attempt {upload_attempts}/{GEMINI_UPLOAD_RETRIES}): {upload_err}")
+                if upload_attempts >= GEMINI_UPLOAD_RETRIES:
+                    app.logger.error(f"{log_prefix}: Gemini file upload failed permanently after {upload_attempts} attempts.")
+                    raise ConnectionError(f"Failed to upload chunk {chunk_index + 1} to Gemini: {upload_err}") from upload_err
+                time.sleep(GEMINI_UPLOAD_RETRY_DELAY * upload_attempts) # Simple backoff
 
-            # --- Wait for File Processing on Gemini ---
-            app.logger.info(f"{log_prefix}: Waiting for Gemini file processing...")
-            polling_interval = 5
-            max_wait_time = 300
-            start_wait_time = time.monotonic()
-            while True:
-                try:
-                    current_file_status = genai.get_file(name=gemini_file_name)
-                except google_exceptions.GoogleAPIError as get_file_err:
-                     app.logger.warning(f"{log_prefix}: Error getting file status ({gemini_file_name}): {get_file_err}. Retrying...")
-                     if time.monotonic() - start_wait_time > max_wait_time:
-                         raise TimeoutError(f"Gemini get_file status timed out for chunk {chunk_index + 1} ({gemini_file_name}).")
-                     time.sleep(polling_interval)
-                     continue # Retry getting status
+        if not pdf_file_ref or not gemini_file_name:
+            # Should not happen if loop logic is correct, but defensively check
+            raise ConnectionError(f"Failed to get valid Gemini file reference for chunk {chunk_index + 1} after retries.")
 
+        # --- Wait for File Processing on Gemini ---
+        app.logger.info(f"{log_prefix}: Waiting for Gemini file processing...")
+        update_task_status(task_id, status=f"Processing Chunk {chunk_index + 1}/{total_chunks} (Waiting for Gemini)")
+        polling_interval = 5
+        max_wait_time = 400 # Increased wait time slightly
+        start_wait_time = time.monotonic()
+        while True:
+            try:
+                current_file_status = genai.get_file(name=gemini_file_name)
                 state = current_file_status.state.name
-                if state == "ACTIVE":
-                    app.logger.info(f"{log_prefix}: Gemini file is ACTIVE.")
-                    break
-                if state == "FAILED":
-                    raise ValueError(f"Gemini file processing failed for chunk {chunk_index + 1} ({gemini_file_name}).")
-                if state == "PROCESSING":
-                     app.logger.debug(f"{log_prefix}: State is PROCESSING, waiting {polling_interval}s...")
-                     if time.monotonic() - start_wait_time > max_wait_time:
-                         raise TimeoutError(f"Gemini file processing timed out for chunk {chunk_index + 1} ({gemini_file_name}).")
-                     time.sleep(polling_interval)
-                else: # Unexpected state
-                     raise ValueError(f"Gemini file chunk {chunk_index + 1} ({gemini_file_name}) in unexpected state: {state}.")
+            except google_exceptions.NotFound:
+                 app.logger.error(f"{log_prefix}: Gemini file {gemini_file_name} not found during polling. Assuming failure.")
+                 raise ValueError(f"Gemini file vanished during processing for chunk {chunk_index + 1}.")
+            except google_exceptions.GoogleAPIError as get_file_err:
+                 app.logger.warning(f"{log_prefix}: Error getting file status ({gemini_file_name}): {get_file_err}. Retrying check...")
+                 if time.monotonic() - start_wait_time > max_wait_time:
+                     raise TimeoutError(f"Gemini get_file status check timed out for chunk {chunk_index + 1} ({gemini_file_name}).")
+                 time.sleep(polling_interval)
+                 continue # Retry getting status
 
-            # --- Enhanced Prompt ---
-            prompt = """Transcribe the entire PDF in a properly formatted manner. Fill in any corrupted or missing words to ensure readability. Ignore all tables unless they contain simple data that can be adjusted for proper spacing to resemble a table. If a table is too complex, unreadable, or does not make sense (such as an intricate diagram or image-based table), omit it entirely. Ensure proper formatting, including appropriate spacing, paragraph structure, and line breaks. Do not include any introductory text such as 'Here is the transcription' or introductory sings such as apostrophe or anything else —simply begin transcribing the content directly.""" # Removed trailing newline for consistency
+            if state == "ACTIVE":
+                app.logger.info(f"{log_prefix}: Gemini file is ACTIVE.")
+                break
+            if state == "FAILED":
+                app.logger.error(f"{log_prefix}: Gemini file processing failed ({gemini_file_name}). State: {state}")
+                raise ValueError(f"Gemini file processing failed for chunk {chunk_index + 1} ({gemini_file_name}).")
+            if state == "PROCESSING":
+                 app.logger.debug(f"{log_prefix}: State is PROCESSING, waiting {polling_interval}s...")
+                 if time.monotonic() - start_wait_time > max_wait_time:
+                     raise TimeoutError(f"Gemini file processing timed out for chunk {chunk_index + 1} ({gemini_file_name}).")
+                 time.sleep(polling_interval)
+            else: # Unexpected state
+                 app.logger.error(f"{log_prefix}: Gemini file chunk {chunk_index + 1} ({gemini_file_name}) in unexpected state: {state}.")
+                 raise ValueError(f"Gemini file chunk {chunk_index + 1} ({gemini_file_name}) in unexpected state: {state}.")
 
-            # --- Call Gemini API with Rate Limiting and Retry Logic ---
-            app.logger.info(f"{log_prefix}: Preparing to call Gemini generate_content API (checking rate limit).")
+        # --- Enhanced Prompt ---
+        prompt = """Transcribe the entire PDF in a properly formatted manner. Fill in any corrupted or missing words. Omit pages numbers wherver present. Ignore all tables and images. Ensure proper formatting, including appropriate and enough spacing, paragraph structure, and line breaks. Do not include any introductory text such as 'Here is the transcription' or introductory signs such as apostrophe or anything else —simply begin transcribing the content directly."""
 
-            # >>> Apply Rate Limiting <<<
-            wait_for_rate_limit()
-            app.logger.info(f"{log_prefix}: Rate limit passed, proceeding with API call.")
-            # >>> Rate Limiting Applied <<<
+        # --- Call Gemini API with Rate Limiting and Enhanced Retry Logic ---
+        app.logger.info(f"{log_prefix}: Preparing to call Gemini generate_content API (checking rate limit).")
+        update_task_status(task_id, status=f"Transcribing Chunk {chunk_index + 1}/{total_chunks} (Checking Rate Limit)")
 
-            request_options = {"timeout": GEMINI_API_TIMEOUT}
-            response = None
-            last_exception = None
-            transcribed_text = "[Chunk Processing Error]" # Default in case of failure
+        # >>> Apply Rate Limiting <<<
+        wait_for_rate_limit()
+        app.logger.info(f"{log_prefix}: Rate limit passed, proceeding with API call.")
+        update_task_status(task_id, status=f"Transcribing Chunk {chunk_index + 1}/{total_chunks} (Calling API)")
+        # >>> Rate Limiting Applied <<<
 
-            for attempt in range(GEMINI_MAX_RETRIES + 1):
+        request_options = {"timeout": GEMINI_API_TIMEOUT}
+        response = None
+        last_exception = None
+        transcribed_text = None # Initialize as None, set on success
+
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
+            try:
+                app.logger.info(f"{log_prefix}: Calling Gemini generate_content (Attempt {attempt + 1}/{GEMINI_MAX_RETRIES + 1}).")
+                response = model.generate_content([prompt, pdf_file_ref], request_options=request_options)
+
+                # Check for blocked response or empty parts right after call
+                if not response.parts:
+                     block_reason = "Unknown"
+                     safety_ratings_str = "N/A"
+                     if response.prompt_feedback:
+                         block_reason = response.prompt_feedback.block_reason.name if response.prompt_feedback.block_reason else "No Block Reason"
+                         safety_ratings_str = str(response.prompt_feedback.safety_ratings)
+                     app.logger.warning(f"{log_prefix}: Response has no parts (potentially blocked or empty). Reason: {block_reason}. Safety Ratings: {safety_ratings_str}")
+                     # Treat as a "successful" call but with specific content
+                     transcribed_text = f"[Chunk {chunk_index + 1} - Transcription Blocked or Empty (Reason: {block_reason})]"
+                     last_exception = None # Not an API error to retry
+                     break # Exit retry loop
+
+                # If successful and has parts, get text
+                # Add error handling for accessing .text in case it fails unexpectedly
                 try:
-                    app.logger.info(f"{log_prefix}: Calling Gemini generate_content (Attempt {attempt + 1}/{GEMINI_MAX_RETRIES + 1}).")
-                    response = model.generate_content([prompt, pdf_file_ref], request_options=request_options)
-
-                    # Check for blocked response right after call
-                    if not response.parts: # Check if parts list is empty
-                         app.logger.warning(f"{log_prefix}: Response has no parts (potentially blocked or empty).")
-                         if response.prompt_feedback:
-                             app.logger.warning(f"{log_prefix}: Prompt Feedback: {response.prompt_feedback}")
-                         transcribed_text = f"[Chunk {chunk_index + 1} - Transcription Blocked or Empty]"
-                         last_exception = None # Not an error to retry
-                         break # Exit retry loop
-
-                    # If successful and has parts, get text
                     transcribed_text = response.text
-                    app.logger.info(f"{log_prefix}: Successfully transcribed chunk (Attempt {attempt + 1}).")
-                    last_exception = None # Clear last exception on success
-                    break # Exit retry loop on success
-
-                except (google_exceptions.DeadlineExceeded, google_exceptions.ServiceUnavailable, TimeoutError) as transient_error:
-                    last_exception = transient_error
-                    app.logger.warning(f"{log_prefix}: Transient error on attempt {attempt + 1}/{GEMINI_MAX_RETRIES + 1}: {transient_error}. Retrying...")
-                    if attempt < GEMINI_MAX_RETRIES:
-                        # Exponential backoff with jitter
-                        delay = (GEMINI_RETRY_DELAY_BASE ** attempt) + random.uniform(0, 1)
-                        time.sleep(delay)
+                    # Check for potential hidden errors/empty text even if parts exist
+                    if not transcribed_text or transcribed_text.isspace():
+                        app.logger.warning(f"{log_prefix}: Successfully received response, but .text is empty or whitespace.")
+                        transcribed_text = f"[Chunk {chunk_index + 1} - Transcription Resulted in Empty Text]"
                     else:
-                        app.logger.error(f"{log_prefix}: Max retries reached for transient error.")
-                        # Keep last_exception set
+                        app.logger.info(f"{log_prefix}: Successfully transcribed chunk (Attempt {attempt + 1}). Size: {len(transcribed_text)} chars.")
 
-                except (google_exceptions.ResourceExhausted) as quota_error:
-                    # Specific handling for quota errors, often indicating rate limits hit on the *API side*
-                    last_exception = quota_error
-                    app.logger.error(f"{log_prefix}: Google API Quota/Rate Limit Error on attempt {attempt + 1}: {quota_error}. Check API Quotas. Waiting before retry...")
-                    if attempt < GEMINI_MAX_RETRIES:
-                        # Wait longer for quota issues
-                        delay = (GEMINI_RETRY_DELAY_BASE ** (attempt + 1)) + random.uniform(1, 5) # Longer base wait
-                        time.sleep(delay)
-                    else:
-                        app.logger.error(f"{log_prefix}: Max retries reached for quota error.")
-                        # Keep last_exception set
-
-                except (google_exceptions.GoogleAPIError, ValueError, Exception) as non_retryable_error:
-                    # Catch other API errors, value errors (e.g., from response.text), or unexpected errors
-                    app.logger.error(f"{log_prefix}: Non-retryable error during Gemini API call: {non_retryable_error}", exc_info=True)
-                    last_exception = non_retryable_error # Record the fatal error
-                    break # Stop retrying on non-retryable errors
+                except ValueError as ve:
+                     # Handle cases where response.text might raise ValueError (e.g., multipart image/text response without text)
+                     app.logger.warning(f"{log_prefix}: ValueError accessing response.text on attempt {attempt + 1}: {ve}. Assuming empty/failed chunk.")
+                     transcribed_text = f"[Chunk {chunk_index + 1} - Error Accessing Text Content: {ve}]"
+                except Exception as text_access_err:
+                    app.logger.error(f"{log_prefix}: Unexpected error accessing response.text on attempt {attempt+1}: {text_access_err}", exc_info=True)
+                    transcribed_text = f"[Chunk {chunk_index + 1} - Unexpected Error Accessing Text Content]"
 
 
-            # If loop finished due to max retries or non-retryable error
-            if last_exception:
-                 app.logger.error(f"{log_prefix}: Final failure after retries or due to non-retryable error: {last_exception}")
-                 # Re-raise the last known significant error
-                 raise ConnectionError(f"Gemini API call failed for chunk {chunk_index + 1}: {last_exception}") from last_exception
+                last_exception = None # Clear last exception on successful processing (even if content is empty/blocked)
+                break # Exit retry loop on success/handled block
 
-            # Return the result (index and text)
-            return chunk_index, transcribed_text
+            except (google_exceptions.DeadlineExceeded, google_exceptions.ServiceUnavailable, TimeoutError) as transient_error:
+                last_exception = transient_error
+                app.logger.warning(f"{log_prefix}: Transient error on attempt {attempt + 1}/{GEMINI_MAX_RETRIES + 1}: {transient_error}. Retrying...")
+                if attempt < GEMINI_MAX_RETRIES:
+                    # Exponential backoff with jitter
+                    delay = (GEMINI_RETRY_DELAY_BASE ** attempt) + random.uniform(0, 2) # Increased jitter range slightly
+                    app.logger.info(f"{log_prefix}: Waiting {delay:.2f} seconds before next retry.")
+                    update_task_status(task_id, status=f"Transcribing Chunk {chunk_index + 1}/{total_chunks} (API Retry {attempt+1}, Waiting {delay:.1f}s)")
+                    time.sleep(delay)
+                else:
+                    app.logger.error(f"{log_prefix}: Max retries ({GEMINI_MAX_RETRIES + 1}) reached for transient error.")
+                    # Keep last_exception set
 
-        except Exception as e:
-            # Log error here, but re-raise to be caught by the main processing loop
-            app.logger.error(f"{log_prefix}: Unhandled exception in chunk processing: {e}", exc_info=True)
-            # Ensure status reflects failure in the main loop
-            raise e # Re-raise the original exception
+            except (google_exceptions.ResourceExhausted) as quota_error:
+                # Specific handling for quota errors, often indicating rate limits hit on the *API side*
+                last_exception = quota_error
+                app.logger.error(f"{log_prefix}: Google API Quota/Rate Limit Error on attempt {attempt + 1}: {quota_error}. Check API Quotas. Waiting before retry...")
+                if attempt < GEMINI_MAX_RETRIES:
+                    # Wait significantly longer for quota issues
+                    delay = (GEMINI_RETRY_DELAY_BASE ** (attempt + 1)) + random.uniform(5, 15) # Longer base wait, more jitter
+                    app.logger.info(f"{log_prefix}: Waiting {delay:.2f} seconds due to quota error before next retry.")
+                    update_task_status(task_id, status=f"Transcribing Chunk {chunk_index + 1}/{total_chunks} (API Quota Retry {attempt+1}, Waiting {delay:.1f}s)")
+                    time.sleep(delay)
+                else:
+                    app.logger.error(f"{log_prefix}: Max retries ({GEMINI_MAX_RETRIES + 1}) reached for quota error.")
+                    # Keep last_exception set
 
-        finally:
-            # --- Cleanup ---
-            # 1. Delete the file from Gemini (always attempt this)
-            if gemini_file_name and not gemini_file_deleted:
-                try:
-                    genai.delete_file(name=gemini_file_name)
-                    gemini_file_deleted = True
-                    app.logger.info(f"{log_prefix}: Deleted Gemini file: {gemini_file_name}")
-                except Exception as delete_err:
-                    # Log as warning, cleanup failure shouldn't fail the whole process typically
-                    app.logger.warning(f"{log_prefix}: Failed to delete Gemini file {gemini_file_name}: {delete_err}")
+            except (google_exceptions.GoogleAPIError, ValueError, Exception) as non_retryable_error:
+                # Catch other API errors, value errors (e.g., malformed response), or unexpected errors
+                app.logger.error(f"{log_prefix}: Non-retryable/unexpected error during Gemini API call: {non_retryable_error}", exc_info=True)
+                last_exception = non_retryable_error # Record the fatal error
+                break # Stop retrying on non-retryable/unexpected errors
 
-            # 2. Delete the local chunk file (always attempt this)
-            if os.path.exists(chunk_path) and not local_chunk_deleted:
-                try:
-                    os.remove(chunk_path)
-                    local_chunk_deleted = True
-                    app.logger.info(f"{log_prefix}: Removed local chunk file: {chunk_path}")
-                except OSError as e_clean:
-                    app.logger.error(f"{log_prefix}: Error removing local chunk file {chunk_path}: {e_clean}")
 
-            app.logger.info(f"{log_prefix}: Releasing semaphore.")
-            # Semaphore released automatically by 'with' block
+        # --- Handle Final Outcome ---
+        # If loop finished due to max retries or non-retryable error
+        if last_exception:
+             app.logger.error(f"{log_prefix}: Final failure after retries or due to non-retryable error: {last_exception}")
+             # Raise the last known significant error to signal failure for this chunk
+             raise ConnectionError(f"Gemini API call failed permanently for chunk {chunk_index + 1}: {last_exception}") from last_exception
+
+        # If loop finished successfully (including handled blocks/empty text)
+        if transcribed_text is None:
+             # This should theoretically not happen if the logic above is correct, but as a safeguard:
+             app.logger.error(f"{log_prefix}: Processing finished but transcribed_text is unexpectedly None.")
+             raise ValueError(f"Transcription result was unexpectedly None for chunk {chunk_index + 1}.")
+
+        # Return the result (index and text)
+        return chunk_index, transcribed_text
+
+    except Exception as e:
+        # Log any exception caught within this function
+        app.logger.error(f"{log_prefix}: Unhandled exception in chunk processing: {e}", exc_info=True)
+        # Re-raise the exception to be caught by the main processing loop
+        raise e
+
+    finally:
+        # --- Cleanup ---
+        # 1. Delete the file from Gemini (always attempt this)
+        if gemini_file_name and not gemini_file_deleted:
+            try:
+                genai.delete_file(name=gemini_file_name)
+                gemini_file_deleted = True
+                app.logger.info(f"{log_prefix}: Deleted Gemini file: {gemini_file_name}")
+            except Exception as delete_err:
+                # Log as warning, cleanup failure shouldn't fail the whole process typically
+                app.logger.warning(f"{log_prefix}: Failed to delete Gemini file {gemini_file_name}: {delete_err}")
+
+        # 2. Delete the local chunk file (always attempt this)
+        if os.path.exists(chunk_path) and not local_chunk_deleted:
+            try:
+                os.remove(chunk_path)
+                local_chunk_deleted = True
+                app.logger.info(f"{log_prefix}: Removed local chunk file: {chunk_path}")
+            except OSError as e_clean:
+                app.logger.error(f"{log_prefix}: Error removing local chunk file {chunk_path}: {e_clean}")
+
+        # Note: No semaphore here as we control concurrency via MAX_CONCURRENT_WORKERS in ThreadPoolExecutor
 
 
 def process_uploaded_pdf(task_id, original_filepath, original_filename):
     """
-    Main background task function: Chunks PDF, manages concurrent processing, compiles results.
+    Main background task function: Chunks PDF, manages concurrent processing,
+    waits for all chunks, compiles results sequentially, and handles errors robustly.
     """
     task_id_str = str(task_id)
     log_prefix = f"Task {task_id_str}"
@@ -440,8 +488,9 @@ def process_uploaded_pdf(task_id, original_filepath, original_filename):
 
     chunk_paths = []
     num_chunks = 0
-    processing_failed = False
-    final_error_message = None
+    total_pages = 0
+    processing_failed = False # Flag to indicate if any chunk failed permanently
+    final_error_message = None # Store the first critical error message
 
     try:
         # --- 1. Chunk the PDF ---
@@ -452,41 +501,45 @@ def process_uploaded_pdf(task_id, original_filepath, original_filename):
             reader = PdfReader(original_filepath)
             total_pages = len(reader.pages)
             if total_pages == 0:
-                raise ValueError("PDF file has 0 pages or could not be read.")
+                raise ValueError("PDF file has 0 pages or could not be read properly.")
 
             num_chunks = (total_pages + MAX_PAGES_PER_CHUNK - 1) // MAX_PAGES_PER_CHUNK
             update_task_status(task_id_str, total_chunks=num_chunks)
-            app.logger.info(f"{log_prefix}: PDF has {total_pages} pages, splitting into {num_chunks} chunks.")
+            app.logger.info(f"{log_prefix}: PDF has {total_pages} pages, aiming for {num_chunks} chunks.")
 
+            created_chunk_count = 0
             for i in range(num_chunks):
                 writer = PdfWriter()
                 start_page = i * MAX_PAGES_PER_CHUNK
                 end_page = min(start_page + MAX_PAGES_PER_CHUNK, total_pages)
                 app.logger.debug(f"{log_prefix}: Creating chunk {i+1} (pages {start_page+1}-{end_page})")
+                pages_added_to_chunk = 0
                 for page_num in range(start_page, end_page):
                     try:
                         writer.add_page(reader.pages[page_num])
+                        pages_added_to_chunk += 1
                     except Exception as page_err:
                          # Log warning for specific page error, but try to continue chunking
                          app.logger.warning(f"{log_prefix}: Error adding page {page_num + 1} to chunk {i+1}: {page_err}. Skipping page.")
 
                 # Check if writer actually contains pages before saving
-                if len(writer.pages) > 0:
+                if pages_added_to_chunk > 0:
                     chunk_filename = f"chunk_{i+1}.pdf"
                     chunk_filepath = os.path.join(task_upload_dir, chunk_filename)
                     try:
                         with open(chunk_filepath, 'wb') as chunk_file:
                             writer.write(chunk_file)
-                        chunk_paths.append(chunk_filepath)
+                        # Store tuple: (chunk_index, chunk_filepath)
+                        chunk_paths.append((i, chunk_filepath))
+                        created_chunk_count += 1
                         app.logger.info(f"{log_prefix}: Created chunk {i+1}/{num_chunks} at {chunk_filepath}")
                     except IOError as write_err:
                          app.logger.error(f"{log_prefix}: Failed to write chunk file {chunk_filepath}: {write_err}")
-                         # Decide if this is fatal or if we can continue without this chunk
+                         # Treat failure to write a chunk as potentially fatal for the whole process
                          raise IOError(f"Failed to write chunk {i+1}") from write_err
                 else:
-                     app.logger.warning(f"{log_prefix}: Chunk {i+1} was empty (possibly due to page errors). Skipping chunk.")
-                     # Adjust num_chunks if we skip one? Or handle missing results later.
-                     # For simplicity, we'll keep num_chunks and expect missing results later.
+                     app.logger.warning(f"{log_prefix}: Chunk {i+1} was empty (all pages failed to add). Skipping chunk.")
+                     # We will handle missing results later during compilation
 
         except PdfReadError as pdf_err:
              app.logger.error(f"{log_prefix}: Error reading PDF file {original_filepath}: {pdf_err}", exc_info=True)
@@ -498,132 +551,161 @@ def process_uploaded_pdf(task_id, original_filepath, original_filename):
              processing_failed = True
 
         if processing_failed:
-             update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message) # Update status immediately
+             update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
              return # Stop processing
 
-        # If some chunks were skipped, adjust num_chunks? No, let's use the original count for progress.
-        app.logger.info(f"{log_prefix}: Finished chunking. Created {len(chunk_paths)} chunk files (target: {num_chunks}).")
+        app.logger.info(f"{log_prefix}: Finished chunking. Created {len(chunk_paths)} actual chunk files (target was {num_chunks}).")
         if len(chunk_paths) == 0 and num_chunks > 0:
-             final_error_message = "PDF Chunking Failed: No valid chunks could be created."
+             final_error_message = "PDF Chunking Failed: No valid chunks could be created (e.g., all pages were erroneous)."
              update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
              return
 
-        # --- 2. Process Chunks Concurrently ---
+        # --- 2. Process Chunks Concurrently and Wait for All ---
         update_task_status(task_id_str, status="Starting transcription process...")
-        results = {} # Store results keyed by chunk index (0-based)
-        processed_count = 0
-        futures_submitted = 0
+        # Dictionary to store results OR exceptions, keyed by chunk index
+        results_map = {} # { chunk_index: "transcribed text" }
+        exception_map = {} # { chunk_index: Exception }
+        futures_list = []
 
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS, thread_name_prefix=f"Task_{task_id_str}_Worker") as executor:
-            # Create a list of futures to manage
-            futures_map = {}
-            for i, chunk_path in enumerate(chunk_paths):
-                 future = executor.submit(process_pdf_chunk, chunk_path, task_id_str, i, num_chunks)
-                 futures_map[future] = i # Map future back to original chunk index
-                 futures_submitted += 1
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WORKERS, thread_name_prefix=f"Task_{task_id_str}_Worker") as executor:
+            # Submit all chunk processing tasks
+            for chunk_index, chunk_path in chunk_paths:
+                 future = executor.submit(process_pdf_chunk, chunk_path, task_id_str, chunk_index, num_chunks)
+                 # Store future along with its original chunk index for later retrieval
+                 futures_list.append((chunk_index, future))
 
-            app.logger.info(f"{log_prefix}: Submitted {futures_submitted} chunk processing tasks to executor.")
+            app.logger.info(f"{log_prefix}: Submitted {len(futures_list)} chunk processing tasks to executor. Waiting for completion...")
+            update_task_status(task_id_str, status=f"Processing {len(futures_list)} chunks...")
 
-            for future in as_completed(futures_map):
-                chunk_index = futures_map[future] # Get the original index 'i'
+            # Wait for ALL submitted futures to complete (robustly)
+            # We iterate through our original list to ensure we check every submitted future.
+            processed_count = 0
+            for chunk_index, future in futures_list:
                 try:
-                    index, text = future.result() # Retrieve result (re-raises exceptions from worker)
-                    results[index] = text
+                    # future.result() will re-raise any exception caught in the worker
+                    idx, text = future.result()
+                    results_map[idx] = text
+                    app.logger.info(f"{log_prefix}: Successfully processed chunk {idx + 1}/{num_chunks}.")
+                    # Update progress based on completion
                     processed_count += 1
-                    # Update status more frequently inside the loop
-                    update_task_status(task_id_str, processed_increment=1, status=f"Processing: Chunk {processed_count}/{num_chunks} completed.")
-                    app.logger.info(f"{log_prefix}: Received result for chunk {index + 1}")
+                    update_task_status(task_id_str, processed_increment=1, status=f"Processing: {processed_count}/{len(futures_list)} chunks done.")
+
                 except Exception as e:
-                    app.logger.error(f"{log_prefix}: Chunk {chunk_index + 1} processing failed: {e}")
-                    processing_failed = True
+                    app.logger.error(f"{log_prefix}: Chunk {chunk_index + 1} processing failed permanently: {e}", exc_info=False) # Avoid too much noise in main log
+                    processing_failed = True # Mark the overall task as failed
+                    exception_map[chunk_index] = e # Store the exception
                     # Capture the *first* critical error message for the final status
                     if not final_error_message:
-                         final_error_message = f"Transcription failed on chunk {chunk_index + 1}: {type(e).__name__}" # Don't include full error details in user status
-                    # Update task status immediately to show an error state
-                    # Use processed_increment=1 because the *attempt* finished, even if it failed
-                    update_task_status(task_id_str, processed_increment=1, status=f"Error occurred during processing (Chunk {chunk_index + 1}). See logs.", error_message=final_error_message)
-                    # Continue processing other chunks, but the task will ultimately be marked as failed.
+                         final_error_message = f"Transcription failed on chunk {chunk_index + 1}: {type(e).__name__}"
+                    # Update progress even on failure (attempt completed)
+                    processed_count += 1
+                    update_task_status(task_id_str, processed_increment=1, error_message=final_error_message, status=f"Error occurred (Chunk {chunk_index + 1}). Processing {processed_count}/{len(futures_list)} chunks.")
 
+        app.logger.info(f"{log_prefix}: All {len(futures_list)} submitted chunk tasks have completed.")
 
-        # --- 3. Check for Errors and Compile Results ---
-        if processing_failed:
-             app.logger.error(f"{log_prefix}: Transcription process failed due to errors. Final error: {final_error_message}")
-             # Final error status already set by the failing chunk future or check below.
-             # Ensure the status reflects the error if it hasn't been updated yet.
-             update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
-             schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60) # Schedule cleanup even on failure
-             return
-
-        # Verify expected number of results (consider skipped chunks during creation)
-        # Check against the number of chunks actually submitted to the executor.
-        if len(results) != futures_submitted:
-             app.logger.error(f"{log_prefix}: Mismatch in processed chunks. Submitted {futures_submitted} tasks, got {len(results)} results.")
-             final_error_message = "Internal error: Not all submitted chunks returned a result."
-             update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
-             processing_failed = True
-             schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
-             return
-
-        # Compile results
+        # --- 3. Compile Results Sequentially ---
         update_task_status(task_id_str, status="Compiling transcribed text...")
         app.logger.info(f"{log_prefix}: Compiling results into {output_filepath}")
         os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
+        compiled_successfully = False
         try:
             with open(output_filepath, 'w', encoding='utf-8') as outfile:
                 all_text_parts = []
-                for i in range(num_chunks): # Iterate based on original expected chunks
-                    # Check if a result exists for this index (it might be missing if chunking failed or skipped)
-                    if i in results:
-                        all_text_parts.append(results[i])
+                # Iterate based on the *original* number of chunks expected (0 to num_chunks-1)
+                for i in range(num_chunks):
+                    if i in results_map:
+                        # Chunk processed successfully
+                        all_text_parts.append(results_map[i])
+                    elif i in exception_map:
+                        # Chunk failed permanently
+                        app.logger.warning(f"{log_prefix}: Including error marker for failed chunk {i+1}.")
+                        exc = exception_map[i]
+                        all_text_parts.append(f"\n\n--- ERROR: Transcription for pages ~{i*MAX_PAGES_PER_CHUNK + 1}-{min((i+1)*MAX_PAGES_PER_CHUNK, total_pages)} failed ---\nError Type: {type(exc).__name__}\nDetails: {str(exc)}\n---\n\n")
                     else:
-                         # Check if the chunk path existed - if not, it was skipped during chunking
-                         chunk_filename = f"chunk_{i+1}.pdf"
-                         chunk_filepath = os.path.join(task_upload_dir, chunk_filename)
-                         if any(chunk_filepath in p for p in chunk_paths):
-                             # It was submitted but failed/missing result (should have been caught above, but check again)
-                             app.logger.warning(f"{log_prefix}: Result for chunk index {i} missing despite being submitted.")
-                             all_text_parts.append(f"\n\n[ERROR: Transcription for pages {i*MAX_PAGES_PER_CHUNK + 1} - {min((i+1)*MAX_PAGES_PER_CHUNK, total_pages)} failed or was lost.]\n\n")
-                         else:
-                             # Chunk was skipped during initial PDF processing
-                             app.logger.warning(f"{log_prefix}: Chunk index {i} was skipped during PDF creation (e.g., page errors).")
-                             all_text_parts.append(f"\n\n[INFO: Pages {i*MAX_PAGES_PER_CHUNK + 1} - {min((i+1)*MAX_PAGES_PER_CHUNK, total_pages)} may have been skipped due to PDF read errors.]\n\n")
+                        # Chunk was potentially skipped during chunking phase (e.g., empty chunk)
+                        # Check if it was in the original `chunk_paths` list submitted
+                        was_submitted = any(idx == i for idx, path in chunk_paths)
+                        if was_submitted:
+                             # This case should ideally not happen if exception_map catches all failures
+                             app.logger.error(f"{log_prefix}: Result for chunk index {i} missing despite being submitted and no exception recorded!")
+                             all_text_parts.append(f"\n\n[INTERNAL ERROR: Transcription result for pages ~{i*MAX_PAGES_PER_CHUNK + 1} - {min((i+1)*MAX_PAGES_PER_CHUNK, total_pages)} was lost.]\n\n")
+                        else:
+                             # Chunk was skipped during initial PDF processing/writing
+                             app.logger.warning(f"{log_prefix}: Chunk index {i} was not created/submitted (e.g., skipped due to page errors).")
+                             all_text_parts.append(f"\n\n[INFO: Pages ~{i*MAX_PAGES_PER_CHUNK + 1} - {min((i+1)*MAX_PAGES_PER_CHUNK, total_pages)} may have been skipped during PDF chunking.]\n\n")
 
                 # Join all parts with a consistent separator (e.g., double newline)
-                outfile.write("\n\n".join(all_text_parts))
+                final_text = "\n\n".join(all_text_parts).strip()
+                if not final_text:
+                    final_text = "[No content transcribed. The PDF might have been empty, unreadable, or all chunks failed.]"
+                    app.logger.warning(f"{log_prefix}: Compiled text is empty.")
+
+                outfile.write(final_text)
+                compiled_successfully = True
 
             app.logger.info(f"{log_prefix}: Successfully compiled text to {output_filepath}")
+
         except IOError as e:
              app.logger.error(f"{log_prefix}: Failed to write compiled output file {output_filepath}: {e}", exc_info=True)
-             final_error_message = f"Failed to write output file: {e}"
+             # This is a critical failure after processing
+             final_error_message = f"Failed to write final output file: {e}"
+             processing_failed = True # Mark as failed
              update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
-             processing_failed = True
-             schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
-             return
+             # No return here, proceed to cleanup scheduling
 
-        # --- 4. Mark as Complete & Schedule Cleanup ---
-        completion_time = datetime.now(timezone.utc)
-        expiry_time = completion_time + timedelta(minutes=DOWNLOAD_EXPIRY_MINUTES)
-        update_task_status(
-            task_id_str,
-            status="Completed",
-            output_filename=output_filename,
-            completion_time=completion_time.isoformat(),
-            expiry_time=expiry_time.isoformat()
-        )
-        schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
-        app.logger.info(f"{log_prefix}: Processing complete. Output ready: {output_filename}. Expiry: {expiry_time.isoformat()}")
+        # --- 4. Final Status Update & Schedule Cleanup ---
+        if processing_failed:
+             app.logger.error(f"{log_prefix}: Transcription process finished with errors. Final error message: {final_error_message}")
+             # Update status one last time to ensure error state is set clearly
+             # If compilation succeeded despite chunk errors, keep the output file available
+             if compiled_successfully:
+                 completion_time = datetime.now(timezone.utc)
+                 expiry_time = completion_time + timedelta(minutes=DOWNLOAD_EXPIRY_MINUTES)
+                 update_task_status(
+                     task_id_str,
+                     status=f"Completed with Errors (See file for details). First error: {final_error_message}",
+                     error_message=final_error_message, # Ensure error flag is true
+                     output_filename=output_filename, # Provide the partially successful file
+                     completion_time=completion_time.isoformat(),
+                     expiry_time=expiry_time.isoformat()
+                 )
+                 app.logger.info(f"{log_prefix}: Process completed with errors, partial output saved to {output_filename}.")
+             else:
+                 # Compilation itself failed, or errors occurred before compilation could finish
+                  update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
+             # Schedule cleanup regardless of success/failure
+             schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
+
+        else:
+            # Success Path
+            completion_time = datetime.now(timezone.utc)
+            expiry_time = completion_time + timedelta(minutes=DOWNLOAD_EXPIRY_MINUTES)
+            update_task_status(
+                task_id_str,
+                status="Completed",
+                output_filename=output_filename,
+                completion_time=completion_time.isoformat(),
+                expiry_time=expiry_time.isoformat(),
+                error_message=None # Explicitly clear any prior transient error messages
+            )
+            schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
+            app.logger.info(f"{log_prefix}: Processing complete successfully. Output ready: {output_filename}. Expiry: {expiry_time.isoformat()}")
 
     except Exception as e:
+        # Catch-all for unexpected errors in the main background processing function
         app.logger.error(f"{log_prefix}: Unexpected error in main background processing: {e}", exc_info=True)
         if not processing_failed: # Avoid overwriting specific earlier errors
              final_error_message = f"Unexpected processing error: {type(e).__name__}"
              update_task_status(task_id_str, status=f"Error: {final_error_message}", error_message=final_error_message)
+        else:
+            # Ensure the existing failure status reflects this outer error if needed
+            update_task_status(task_id_str, status=f"Critical Error: {type(e).__name__} during final processing stages. Previous error: {final_error_message}", error_message=final_error_message or f"Critical Error: {type(e).__name__}")
         # Ensure cleanup is scheduled even on unexpected exit
         schedule_cleanup(task_id_str, DOWNLOAD_EXPIRY_MINUTES * 60)
 
     finally:
-        # Final Cleanup: Original Uploaded File (always attempt)
+        # Final Cleanup: Original Uploaded File (always attempt, AFTER processing logic finishes)
         if os.path.exists(original_filepath):
             try:
                 os.remove(original_filepath)
@@ -635,7 +717,12 @@ def process_uploaded_pdf(task_id, original_filepath, original_filename):
 # --- Flask Routes ---
 
 # --- HTML Templates (Dark Theme) ---
-# (Templates remain unchanged - copy them from the original prompt)
+# (Templates remain largely the same - copy the LOGIN_TEMPLATE, UPLOAD_TEMPLATE
+# and STATUS_TEMPLATE from the previous version or the original prompt.
+# Minor tweaks might be needed in STATUS_TEMPLATE to better display
+# statuses like "Completed with Errors" if desired, but the current one
+# should handle error states adequately.)
+
 LOGIN_TEMPLATE = '''
 <!doctype html>
 <html lang="en">
@@ -883,22 +970,30 @@ STATUS_TEMPLATE = '''
         h1 { color: var(--primary-color); margin-bottom: 1em; text-align: center; font-weight: 600; }
         .status-box { background-color: #2a2a2a; padding: 1.2em; border-radius: 8px; margin-bottom: 1.8em; border-left: 5px solid var(--primary-color); }
         .status-box.error { border-left-color: var(--error-color); }
+        /* Slightly different style for completion with errors */
+        .status-box.completed-error { border-left-color: var(--warning-color); }
         .status-box.completed { border-left-color: var(--success-color); }
         .status-box.waiting { border-left-color: var(--warning-color); } /* Style for waiting state */
         .status-label { font-weight: bold; color: var(--text-muted-color); margin-right: 0.5em; }
         .status-text { font-weight: 500; }
         .status-text.error { color: var(--error-color); }
+        .status-text.completed-error { color: var(--warning-color); }
         .status-text.completed { color: var(--success-color); }
         .status-text.waiting { color: var(--warning-color); } /* Style for waiting state */
         .progress-bar { width: 100%; background-color: var(--progress-bg); border-radius: 6px; overflow: hidden; margin-bottom: 1em; height: 28px; }
         .progress-bar-inner { height: 100%; width: 0%; background-color: var(--progress-bar-color); transition: width 0.6s ease; text-align: center; color: #121212; /* Dark text on light bar */ line-height: 28px; font-size: 0.9em; font-weight: bold; white-space: nowrap; }
+        .progress-bar-inner.error { background-color: var(--error-color); color: white; } /* Error progress bar */
         .download-section { margin-top: 2.5em; padding-top: 2em; border-top: 1px solid var(--border-color); text-align: center; }
         .download-section h2 { color: var(--success-color); margin-bottom: 0.8em; }
-        .download-link { display: inline-block; padding: 0.9em 1.8em; background-color: var(--success-color); color: white; text-decoration: none; border-radius: 6px; font-weight: 600; transition: background-color 0.2s ease, transform 0.1s ease; }
+        .download-section h2.completed-error { color: var(--warning-color); } /* Warning color heading */
+        .download-link { display: inline-block; padding: 0.9em 1.8em; background-color: var(--success-color); color: white; text-decoration: none; border-radius: 6px; font-weight: 600; transition: background-color 0.2s ease, transform 0.1s ease; margin-top: 0.5em; }
+        .download-link.completed-error { background-color: var(--warning-color); color: black;}
         .download-link:hover { background-color: #146c43; }
+        .download-link.completed-error:hover { background-color: #d9a000; }
         .download-link:active { transform: translateY(1px); }
         .timer { margin-top: 1.2em; font-weight: bold; color: var(--error-color); font-size: 1.1em; }
         .error-message { color: var(--error-color); font-weight: bold; background-color: rgba(220, 53, 69, 0.1); border: 1px solid var(--error-color); padding: 1.2em; border-radius: 8px; margin-top: 1.5em; }
+        .warning-message { color: var(--warning-color); font-weight: bold; background-color: rgba(255, 193, 7, 0.1); border: 1px solid var(--warning-color); padding: 1.2em; border-radius: 8px; margin-top: 1.5em; }
         .info { color: var(--text-muted-color); margin-bottom: 1.5em; font-size: 0.95em; }
         .info strong { color: var(--text-color); font-weight: 600; }
         .actions { text-align: center; margin-top: 2.5em; padding-top: 1.5em; border-top: 1px solid var(--border-color); }
@@ -912,40 +1007,65 @@ STATUS_TEMPLATE = '''
         <h1>Processing Status</h1>
         <p class="info">Original File: <strong>{{ filename }}</strong></p>
 
-        {% set is_waiting = 'waiting' in task_info.status.lower() or 'rate limit' in task_info.status.lower() %}
-        <div class="status-box {{ 'error' if task_info.error else ('completed' if task_info.status == 'Completed' else ('waiting' if is_waiting else '')) }}">
+        {# Determine Status Category for Styling #}
+        {% set status_category = 'processing' %} {# Default #}
+        {% set status_lower = task_info.status.lower() %}
+        {% if task_info.error %}
+            {% if 'completed' in status_lower %}
+                 {% set status_category = 'completed-error' %}
+            {% else %}
+                 {% set status_category = 'error' %}
+            {% endif %}
+        {% elif 'completed' in status_lower %}
+             {% set status_category = 'completed' %}
+        {% elif 'waiting' in status_lower or 'rate limit' in status_lower %}
+             {% set status_category = 'waiting' %}
+        {% endif %}
+
+        <div class="status-box {{ status_category }}">
             <span class="status-label">Current Status:</span>
-            <span class="status-text {{ 'error' if task_info.error else ('completed' if task_info.status == 'Completed' else ('waiting' if is_waiting else '')) }}">
+            <span class="status-text {{ status_category }}">
                 {{ task_info.status }}
             </span>
         </div>
 
-        {% if task_info.error %}
+        {# --- Progress / Error / Waiting Info --- #}
+        {% if status_category == 'error' %}
             <div class="error-message">
-                An error occurred: {{ task_info.status }} <br> Please review server logs for more details if necessary.
+                Processing failed: {{ task_info.status }} <br> Please check the logs or try again. If the problem persists, contact support.
             </div>
-        {% elif task_info.status != 'Completed' %}
+        {% elif status_category in ['processing', 'waiting'] %}
              {% if task_info.total_chunks > 0 %}
              <div class="progress-bar">
                  <div class="progress-bar-inner" style="width: {{ progress_percent }}%;">
-                    {{ task_info.processed_chunks }} / {{ task_info.total_chunks }} Chunks Processed
+                    {{ task_info.processed_chunks }} / {{ task_info.total_chunks }} Chunks Attempted
                  </div>
              </div>
              {% endif %}
-             {% if is_waiting %}
-                 <p class="waiting-info">The process is currently paused due to API rate limits. It will resume automatically. Please wait.</p>
-             {% elif 'processing' in task_info.status.lower() or 'initializing' in task_info.status.lower() or 'chunking' in task_info.status.lower() or 'compiling' in task_info.status.lower() %}
+
+             {% if status_category == 'waiting' %}
+                 <p class="waiting-info">The process might be temporarily paused due to API rate limits or retries. It should resume automatically. Please wait.</p>
+             {% elif 'processing' in status_lower or 'initializing' in status_lower or 'chunking' in status_lower or 'compiling' in status_lower or 'transcribing' in status_lower or 'uploading' in status_lower %}
                  <p style="text-align: center; color: var(--text-muted-color);">Processing... Please wait. This page will refresh automatically.</p>
              {% else %}
                   <p style="text-align: center; color: var(--text-muted-color);">Starting process... Please wait.</p> {# Fallback state #}
              {% endif %}
 
-        {% elif task_info.status == 'Completed' and not task_info.error %}
+        {# --- Completed (Success or With Errors) --- #}
+        {% elif status_category in ['completed', 'completed-error'] %}
+            {% if status_category == 'completed-error' %}
+                 <div class="warning-message">
+                    Processing completed, but some errors occurred during transcription. The output file may be incomplete or contain error markers. Please review the downloaded file. <br>First error encountered: {{ task_info.status.split('First error: ')[1] if 'First error: ' in task_info.status else 'See file contents.' }}
+                </div>
+            {% endif %}
+
             <div class="download-section">
-                <h2>Transcription Complete!</h2>
+                <h2 class="{{ status_category }}">
+                    {% if status_category == 'completed' %}Transcription Complete!{% else %}Transcription Complete (with errors){% endif %}
+                </h2>
                 {% if download_ready and remaining_seconds > 0 %}
                     <p>Your transcribed file is ready for download.</p>
-                    <a href="{{ url_for('download_file', task_id=task_id) }}" class="download-link" id="download-button">
+                    <a href="{{ url_for('download_file', task_id=task_id) }}" class="download-link {{ status_category }}" id="download-button">
                         Download Transcribed Text (.txt)
                     </a>
                     <div class="timer" id="timer">Download link expires in: <span id="time">{{ remaining_seconds }}</span> seconds</div>
@@ -972,7 +1092,7 @@ STATUS_TEMPLATE = '''
                     </script>
                 {% else %}
                     {# Already expired when page loaded #}
-                    <p class="error-message">The download link for this file has expired.</p>
+                    <p class="error-message">The download link for this file has expired or is not available.</p>
                      <script>
                         // Redirect immediately if page is loaded after expiry
                         setTimeout(() => { window.location.href = "{{ url_for('index') }}"; }, 3000);
@@ -980,10 +1100,11 @@ STATUS_TEMPLATE = '''
                 {% endif %}
             </div>
         {% else %}
-            {# Initializing or unknown state #}
+            {# Unknown state #}
              <p style="text-align: center; color: var(--text-muted-color);">Initializing process... Please wait.</p>
         {% endif %}
 
+        {# --- General Actions --- #}
         <div class="actions">
            <a href="{{ url_for('upload_form') }}">Transcribe Another PDF</a>
            <a href="{{ url_for('logout') }}">Logout</a>
@@ -994,7 +1115,7 @@ STATUS_TEMPLATE = '''
 </html>
 '''
 
-# --- Route Definitions ---
+# --- Route Definitions (Largely unchanged, but review logic) ---
 
 @app.route('/', methods=['GET'])
 def index():
@@ -1017,27 +1138,33 @@ def login():
             app.permanent_session_lifetime = timedelta(hours=8) # Example: 8 hours
             flash("Login successful!", "info")
             app.logger.info("User authenticated successfully.")
+            # Clean up any stale task ID from a *previous* session upon successful login
+            old_task_id = session.pop('task_id', None)
+            if old_task_id:
+                app.logger.info(f"Cleaning up stale task {old_task_id} from previous session on login.")
+                cleanup_task_files(old_task_id)
             return redirect(url_for('upload_form'))
         else:
             flash("Invalid password.", "error")
             app.logger.warning("Failed login attempt.")
-            # Return the template directly on failed POST to show flash message
-            return render_template_string(LOGIN_TEMPLATE)
+            return render_template_string(LOGIN_TEMPLATE) # Show flash message
 
     # Clear potentially stale task ID if user hits login page directly via GET
-    if 'task_id' in session:
-        cleanup_task_files(session.pop('task_id', None))
+    # This might belong to the *current* browser session if they navigate away and back
+    # Only clean if definitively stale (e.g., on successful login or logout)
+    # if 'task_id' in session:
+    #     cleanup_task_files(session.pop('task_id', None)) # Reconsider if this cleanup is too aggressive here
 
     return render_template_string(LOGIN_TEMPLATE)
 
 @app.route('/logout')
 def logout():
-    """Logs the user out."""
-    # Clear session data
+    """Logs the user out and cleans up their current task."""
+    task_id = session.pop('task_id', None) # Get task ID before clearing auth
     session.pop('authenticated', None)
-    task_id = session.pop('task_id', None)
     if task_id:
         # Clean up any active task associated with the logged-out session
+        app.logger.info(f"User logout: Cleaning up associated task {task_id}.")
         cleanup_task_files(task_id)
     flash("You have been logged out.", "info")
     app.logger.info("User logged out.")
@@ -1055,7 +1182,16 @@ def upload_form():
     except OSError as e:
         app.logger.error(f"Could not create temporary directories: {e}")
         flash("Server configuration error: Cannot create temporary storage.", "error")
-        return redirect(url_for('logout')) # Redirect to logout/login on critical error
+        # Redirecting to logout might be too harsh, maybe just show error on upload page?
+        # For now, keep redirect to logout/login on critical setup error.
+        return redirect(url_for('logout'))
+
+    # Clean up any task ID potentially left over if user navigates back to upload
+    # without completing/downloading a previous task.
+    old_task_id = session.pop('task_id', None)
+    if old_task_id:
+        app.logger.info(f"Navigated back to upload: Cleaning up previous task {old_task_id}.")
+        cleanup_task_files(old_task_id)
 
     return render_template_string(UPLOAD_TEMPLATE, max_size_mb=MAX_CONTENT_LENGTH // (1024 * 1024))
 
@@ -1076,46 +1212,45 @@ def process_file():
         flash('Invalid file type. Only PDF files (.pdf) are allowed.', "error")
         return redirect(url_for('upload_form'))
 
-    # --- File Size Check ---
+    # --- File Size Check (Robust) ---
     try:
-        # Check file size using content_length if available, otherwise seek/tell
+        # Prefer checking content_length first
         file_length = request.content_length
-        if file_length is None: # Fallback if content_length isn't available
+        if file_length is None: # Fallback: seek/tell if stream is seekable
             try:
-                # Save current position, seek to end, get size, restore position
-                current_pos = file.tell()
-                file.seek(0, os.SEEK_END)
-                file_length = file.tell()
-                file.seek(current_pos) # Go back to where it was
+                current_pos = file.stream.tell()
+                file.stream.seek(0, os.SEEK_END)
+                file_length = file.stream.tell()
+                file.stream.seek(current_pos) # Reset stream position
                 if file_length is None: raise ValueError("Could not determine file size via seek/tell.")
                 app.logger.warning(f"Using seek/tell for file size check ({file_length} bytes).")
             except (AttributeError, ValueError, IOError) as seek_err:
                  app.logger.error(f"Failed to determine file size using seek/tell: {seek_err}")
-                 raise ValueError("Could not determine file size.")
+                 # If seek fails, we might have already read the file partially.
+                 # We cannot reliably check size here without saving first.
+                 # Let Flask's MAX_CONTENT_LENGTH handle it if possible, or fail gracefully.
+                 # For now, let's proceed and hope MAX_CONTENT_LENGTH catches it, or save fails later.
+                 pass # Continue, size check is best-effort here
 
-        if file_length > app.config['MAX_CONTENT_LENGTH']:
+        # Perform the check if we have a length
+        if file_length is not None and file_length > app.config['MAX_CONTENT_LENGTH']:
              max_mb = app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)
              flash(f'File exceeds the maximum allowed size of {max_mb} MB.', "error")
              return redirect(url_for('upload_form'))
 
-    except RequestEntityTooLarge: # Caught by Flask/Werkzeug if limit exceeded early
+    except RequestEntityTooLarge: # Caught by Flask/Werkzeug
          max_mb = app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)
-         flash(f'File exceeds the maximum allowed size of {max_mb} MB.', "error")
-         return redirect(url_for('upload_form'))
-    except ValueError as size_err: # Error during our own check
-         app.logger.error(f"Error checking file size: {size_err}")
-         flash("Could not verify file size. Please try again.", "error")
+         flash(f'File exceeds the maximum allowed size of {max_mb} MB (detected by server).', "error")
          return redirect(url_for('upload_form'))
     except Exception as e: # Catch unexpected errors during size check
          app.logger.error(f"Unexpected error checking file size: {e}", exc_info=True)
          flash("An unexpected error occurred while checking file size.", "error")
          return redirect(url_for('upload_form'))
 
-
     # --- Prepare for Processing ---
     filename = secure_filename(file.filename)
     task_id = str(uuid.uuid4())
-    # Clean up any previous task associated with the session before starting new one
+    # Clean up any previous task associated with the session *before* starting new one
     old_task_id = session.pop('task_id', None)
     if old_task_id:
         app.logger.info(f"Cleaning up previous task {old_task_id} before starting new task {task_id}.")
@@ -1135,6 +1270,7 @@ def process_file():
     original_filepath = os.path.join(task_upload_dir, filename)
 
     try:
+        # Save the file *after* size check if possible
         file.save(original_filepath)
         app.logger.info(f"Task {task_id}: File '{filename}' saved to '{original_filepath}'")
 
@@ -1148,7 +1284,7 @@ def process_file():
                 'output_filename': None,
                 'completion_time': None,
                 'expiry_time': None,
-                'error': False,
+                'error': False, # Explicitly set error flag
                 'start_time': datetime.now(timezone.utc).isoformat()
             }
 
@@ -1167,7 +1303,8 @@ def process_file():
     except Exception as e:
         app.logger.error(f"Error processing file upload for task {task_id}: {e}", exc_info=True)
         flash(f'Error occurred while initiating the process: {e}', "error")
-        cleanup_task_files(task_id) # Attempt cleanup
+        # Ensure cleanup if initiation fails *after* task dict entry created
+        cleanup_task_files(task_id)
         session.pop('task_id', None) # Remove task ID from session
         return redirect(url_for('upload_form'))
 
@@ -1176,9 +1313,10 @@ def process_file():
 @login_required # Protect this route
 def status_page(task_id):
     """Displays the current status of the processing task."""
+    # Verify task ID belongs to the current session
     if 'task_id' not in session or session['task_id'] != task_id:
-        flash("Invalid task ID or session mismatch.", "warning")
-        # Don't cleanup here, might belong to another valid session
+        flash("Invalid task ID or session mismatch. Please start a new upload.", "warning")
+        # Don't cleanup here, might belong to another valid session that got disconnected
         return redirect(url_for('upload_form')) # Redirect to upload if logged in
 
     with tasks_lock:
@@ -1187,28 +1325,37 @@ def status_page(task_id):
 
     if not task_info:
         flash("Task not found. It may have expired, been cancelled, or encountered an error.", "info")
-        session.pop('task_id', None) # Remove potentially invalid task ID
+        # Remove the potentially invalid task ID from session if it's still there
+        if session.get('task_id') == task_id:
+            session.pop('task_id', None)
         return redirect(url_for('upload_form'))
 
     # --- Calculate Progress and Timers ---
     progress_percent = 0
-    if task_info.get('total_chunks', 0) > 0:
+    total_chunks = task_info.get('total_chunks', 0)
+    processed_chunks = task_info.get('processed_chunks', 0)
+    if total_chunks > 0:
         # Ensure processed_chunks doesn't exceed total_chunks for display
-        processed = min(task_info.get('processed_chunks', 0), task_info['total_chunks'])
-        progress_percent = int((processed / task_info['total_chunks']) * 100)
+        processed_display = min(processed_chunks, total_chunks)
+        progress_percent = int((processed_display / total_chunks) * 100)
 
     remaining_seconds = 0
     download_ready = False
     auto_refresh = False
-    refresh_interval = 5 # seconds (adjust as needed)
+    refresh_interval = 7 # seconds (slightly longer refresh)
 
     task_status = task_info.get('status', 'Unknown')
-    task_error = task_info.get('error', False)
+    task_error = task_info.get('error', False) # Check our explicit error flag
 
-    if task_status == 'Completed' and not task_error:
-        download_ready = True
+    # Determine if task is in a final state (Completed, Completed with Errors, or hard Error)
+    is_completed_successfully = task_status == 'Completed' and not task_error
+    is_completed_with_errors = 'completed' in task_status.lower() and task_error
+    is_final_error_state = task_error and not is_completed_with_errors # e.g., failed during chunking/compiling
+
+    if is_completed_successfully or is_completed_with_errors:
+        download_ready = True # Allow download even if errors occurred, if file exists
         expiry_time_str = task_info.get('expiry_time')
-        if expiry_time_str:
+        if expiry_time_str and task_info.get('output_filename'):
             try:
                 expiry_dt = datetime.fromisoformat(expiry_time_str)
                 now_utc = datetime.now(timezone.utc)
@@ -1217,23 +1364,27 @@ def status_page(task_id):
                 else:
                     remaining_seconds = 0
                     download_ready = False
-                    # Don't modify task_info here, just control template logic
                     app.logger.info(f"Task {task_id}: Status page accessed after expiry time {expiry_dt}.")
-                    # Schedule cleanup again just in case the timer failed
-                    schedule_cleanup(task_id, 1) # Schedule cleanup almost immediately
+                    # Schedule cleanup again just in case the timer failed (short delay)
+                    schedule_cleanup(task_id, 5)
             except (ValueError, TypeError) as e:
                  app.logger.error(f"Task {task_id}: Could not parse expiry_time '{expiry_time_str}': {e}")
                  download_ready = False
-                 # Reflect error state if parsing fails
-                 task_info['status'] = "Error: Invalid download expiry time." # Modify copy for display
+                 # Update the copied task_info for display if parsing fails
+                 task_info['status'] = "Error: Invalid download expiry time data."
                  task_info['error'] = True
         else:
-             download_ready = False # Cannot download if expiry not set
-             task_info['status'] = "Error: Completion data missing." # Modify copy for display
+             download_ready = False # Cannot download if expiry/filename not set
+             if not task_info.get('output_filename'):
+                 app.logger.warning(f"Task {task_id}: Download attempted but output filename missing.")
+             if not expiry_time_str:
+                  app.logger.warning(f"Task {task_id}: Download attempted but expiry time missing.")
+             # Update the copied task_info for display
+             task_info['status'] = "Error: Completion data missing (filename or expiry)."
              task_info['error'] = True
 
-    elif not task_error and task_status != 'Completed':
-        auto_refresh = True # Refresh only if processing and no error
+    elif not is_final_error_state: # Only refresh if actively processing and not in a permanent error state
+        auto_refresh = True
 
     return render_template_string(
         STATUS_TEMPLATE,
@@ -1251,7 +1402,8 @@ def status_page(task_id):
 @app.route('/download/<task_id>')
 @login_required # Protect this route
 def download_file(task_id):
-    """Serves the generated text file for download, checking expiry."""
+    """Serves the generated text file for download, checking expiry and state."""
+    # Verify task ID belongs to the current session
     if 'task_id' not in session or session['task_id'] != task_id:
         app.logger.warning(f"Download attempt failed for task {task_id}: Session mismatch.")
         abort(403) # Forbidden
@@ -1260,18 +1412,23 @@ def download_file(task_id):
         # Get a copy to avoid holding the lock while checking expiry/file system
         task_info = tasks.get(task_id, {}).copy()
 
-    # Check task validity and state
-    if not task_info or task_info.get('error') or task_info.get('status') != 'Completed':
-        app.logger.warning(f"Download attempt failed for task {task_id}: Task invalid state (Not found, Error, or Not Completed). Status: {task_info.get('status')}")
-        flash("Cannot download file: Task not found, not complete, or encountered an error.", "error")
-        # Redirect to status page which will show the error or redirect if task gone
+    # Check task validity and state - Allow download if "Completed" OR "Completed with Errors"
+    task_status = task_info.get('status', '')
+    task_error = task_info.get('error', False)
+    is_downloadable_state = (task_status == 'Completed' and not task_error) or \
+                            ('completed' in task_status.lower() and task_error)
+
+    if not task_info or not is_downloadable_state:
+        app.logger.warning(f"Download attempt failed for task {task_id}: Task state not downloadable (Status: '{task_status}', Error: {task_error}).")
+        flash("Cannot download file: Task is not in a downloadable state (not found, still processing, or failed before completion).", "error")
+        # Redirect to status page which will show the correct state or redirect if task gone
         return redirect(url_for('status_page', task_id=task_id))
 
     output_filename = task_info.get('output_filename')
     expiry_time_str = task_info.get('expiry_time')
 
     if not output_filename or not expiry_time_str:
-        app.logger.error(f"Download attempt failed for task {task_id}: Missing output filename or expiry time.")
+        app.logger.error(f"Download attempt failed for task {task_id}: Missing output filename or expiry time in downloadable state.")
         flash("Cannot download file: Output information missing.", "error")
         return redirect(url_for('status_page', task_id=task_id))
 
@@ -1284,7 +1441,8 @@ def download_file(task_id):
             app.logger.info(f"Download attempt failed for task {task_id}: Link expired at {expiry_dt}.")
             cleanup_task_files(task_id) # Ensure cleanup happens server-side
             flash("The download link for this file has expired.", "error")
-            session.pop('task_id', None) # Remove expired task from session
+            if session.get('task_id') == task_id: # Remove expired task from session
+                 session.pop('task_id', None)
             return redirect(url_for('upload_form')) # Redirect to upload after expiry
     except (ValueError, TypeError) as e:
         app.logger.error(f"Download attempt failed for task {task_id}: Invalid expiry time format '{expiry_time_str}': {e}")
@@ -1297,11 +1455,12 @@ def download_file(task_id):
 
     # Check file existence *after* expiry check
     if not os.path.exists(output_filepath):
-        app.logger.error(f"Download attempt failed for task {task_id}: Output file not found at {output_filepath}.")
-        flash("Cannot download file: Output file not found. It might have been cleaned up.", "error")
+        app.logger.error(f"Download attempt failed for task {task_id}: Output file not found at {output_filepath} (State: {task_status}).")
+        flash("Cannot download file: Output file not found. It might have been cleaned up or failed to generate.", "error")
         # Task might still be in `tasks` dict but file is gone, ensure cleanup
         cleanup_task_files(task_id)
-        session.pop('task_id', None) # Remove invalid task from session
+        if session.get('task_id') == task_id: # Remove invalid task from session
+             session.pop('task_id', None)
         return redirect(url_for('upload_form'))
 
     try:
@@ -1317,7 +1476,7 @@ def download_file(task_id):
         app.logger.error(f"Error sending file {output_filepath} for task {task_id}: {e}", exc_info=True)
         abort(500) # Internal Server Error
 
-# --- Error Handling ---
+# --- Error Handling (Mostly Unchanged) ---
 @app.errorhandler(404)
 def not_found_error(error):
     app.logger.warning(f"404 Not Found error: {request.url}")
@@ -1331,9 +1490,10 @@ def not_found_error(error):
 def forbidden_error(error):
     app.logger.warning(f"403 Forbidden error: {request.url}")
     flash("Access denied. Please log in or ensure you have access to this resource.", "error")
-    # If a task ID is involved, clear it to avoid loops
-    if 'task_id' in request.view_args:
+    # If a task ID is involved (e.g. accessing status/download directly), clear it from session
+    if 'task_id' in request.view_args and session.get('task_id') == request.view_args['task_id']:
         session.pop('task_id', None)
+        app.logger.info("Cleared potentially mismatched task_id from session on 403 error.")
     return redirect(url_for('login')), 403
 
 @app.errorhandler(413) # RequestEntityTooLarge
@@ -1351,22 +1511,23 @@ def request_too_large(error):
 
 @app.errorhandler(500)
 def internal_error(error):
-    # Log the exception details
-    app.logger.error(f"500 Internal Server Error on URL {request.url}: {error}", exc_info=True)
+    # Log the exception details more verbosely
+    err_info = getattr(error, 'original_exception', error)
+    app.logger.error(f"500 Internal Server Error on URL {request.url}: {err_info}", exc_info=True)
 
     # Attempt to provide specific feedback if it's a known Google API issue during processing
     task_id = session.get('task_id')
     error_message = "An internal server error occurred. Please try again later or contact support if the issue persists."
     redirect_target = 'index' # Default redirect
 
+    # Determine redirect target based on context
     if task_id:
+        # If a task is active, always redirect to its status page to show potential errors
         redirect_target = 'status_page'
-        # Check if the error object contains useful info (this depends on the actual error)
-        # Example: Checking for specific Google API errors if possible
-        # if isinstance(getattr(error, 'original_exception', None), google_exceptions.GoogleAPIError):
-        #     error_message = "An error occurred while communicating with the transcription service. Please try again."
-        #     # Optionally update task status to reflect external API error
-        #     # update_task_status(task_id, status="Error: API Communication Failure", error_message="API Communication Failure")
+        # Check if the error object contains useful info (example)
+        # if isinstance(err_info, google_exceptions.GoogleAPIError):
+        #     error_message = "An error occurred while communicating with the transcription service backend. Please check the task status."
+        #     # Task status should already be updated by the background thread if it failed there
     elif 'authenticated' in session:
         redirect_target = 'upload_form'
     else:
@@ -1375,7 +1536,13 @@ def internal_error(error):
     flash(error_message, "error")
 
     if redirect_target == 'status_page':
-        return redirect(url_for(redirect_target, task_id=task_id)), 500
+         # Need task_id for status page redirect
+         # If task_id isn't available for some reason, fall back
+        if task_id:
+             return redirect(url_for(redirect_target, task_id=task_id)), 500
+        else:
+             app.logger.error("500 error occurred with no task_id in session, redirecting to upload form.")
+             return redirect(url_for('upload_form')), 500
     else:
         return redirect(url_for(redirect_target)), 500
 
@@ -1393,9 +1560,11 @@ if __name__ == '__main__':
         exit(1)
 
     port = int(os.environ.get('PORT', 5000))
-    # Use Gunicorn in production: gunicorn --bind 0.0.0.0:$PORT --workers 4 --threads 4 --timeout 120 main_app:app
+    # Use Gunicorn in production: gunicorn --bind 0.0.0.0:$PORT --workers 4 --threads 8 --timeout 120 main_app:app
     # For local development/testing:
     app.logger.info(f"Starting Flask development server on host 0.0.0.0 port {port}")
     # Set debug=False for production simulation, True for easier debugging locally
     # Use threaded=True to handle concurrent requests better with the dev server
+    # Note: The built-in dev server isn't truly multi-process like Gunicorn.
+    # Concurrency is limited by Python's GIL for CPU-bound tasks, but good for I/O.
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
