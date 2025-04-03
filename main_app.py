@@ -53,10 +53,10 @@ OUTPUT_FOLDER = os.path.join(BASE_TEMP_DIR, 'outputs')
 MAX_CONTENT_LENGTH = 200 * 1024 * 1024
 ALLOWED_EXTENSIONS = {'pdf'}
 # Max pages per PDF chunk sent to Gemini
-MAX_PAGES_PER_CHUNK = 10
+MAX_PAGES_PER_CHUNK = 5
 # Max concurrent requests *initiating* to Gemini API (Semaphore limit)
 # The rate limiter will further constrain the *actual* calls per minute.
-MAX_CONCURRENT_REQUESTS = 20 # Keep this for concurrency control, rate limit is separate
+MAX_CONCURRENT_REQUESTS = 29 # Keep this for concurrency control, rate limit is separate
 # Time in minutes the download link remains active
 DOWNLOAD_EXPIRY_MINUTES = 2
 # Secret key for Flask sessions (important for security)
@@ -68,15 +68,15 @@ GEMINI_MODEL_NAME="gemini-2.0-flash-lite-001"
 
 # API Call Settings
 GEMINI_API_TIMEOUT = 600 # 10 minutes timeout for generate_content call
-GEMINI_MAX_RETRIES = 7 # Max retries for transient API errors
-GEMINI_RETRY_DELAY_BASE = 5 # Base delay in seconds for retries
+GEMINI_MAX_RETRIES = 10 # Max retries for transient API errors
+GEMINI_RETRY_DELAY_BASE = 7 # Base delay in seconds for retries
 
 # --- Rate Limiting Configuration ---
 # Strict limit: 20 requests per minute (60 seconds)
-RATE_LIMIT_REQUESTS = 20
-RATE_LIMIT_WINDOW_SECONDS = 65
+RATE_LIMIT_REQUESTS = 29
+RATE_LIMIT_WINDOW_SECONDS = 62
 # Wait time if limit is exceeded: 1 minute 2 seconds = 62 seconds
-RATE_LIMIT_WAIT_SECONDS = 65
+RATE_LIMIT_WAIT_SECONDS = 62
 
 # --- Global State (Use cautiously) ---
 tasks = {} # Dictionary to store task progress and metadata. Key: task_id
