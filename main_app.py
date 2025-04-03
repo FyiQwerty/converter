@@ -322,7 +322,7 @@ def process_pdf_chunk(chunk_path, task_id, chunk_index, total_chunks):
                      raise ValueError(f"Gemini file chunk {chunk_index + 1} ({gemini_file_name}) in unexpected state: {state}.")
 
             # --- Enhanced Prompt ---
-            prompt = """TRANSCRIBE THE WHOLE PDF IN PROPER FORMATTED MANNER AND FILL IN THE CORRUPTED WORDS, IGNORE ALL TABLES JUST TRANSRIBE THE TEXT RELATED CONTENT AND FOR TABLES WITH SIMPLER DATA MAKE SURE TO ADJUST FOR PROPER SPACING SUCH THAT TOO LOOK LIKE A TABLE. MAKE SURE TO PROVIDE TEXT IN PROPER FORMATTED MANNER WITH APPROPRIATE SPACING WHEREVER NEEDED.""" # Removed trailing newline for consistency
+            prompt = """Transcribe the entire PDF in a properly formatted manner. Fill in any corrupted or missing words to ensure readability. Ignore all tables unless they contain simple data that can be adjusted for proper spacing to resemble a table. If a table is too complex, unreadable, or does not make sense (such as an intricate diagram or image-based table), omit it entirely. Ensure proper formatting, including appropriate spacing, paragraph structure, and line breaks. Do not include any introductory text such as 'Here is the transcription' or introductory sings such as apostrophe or anything else —simply begin transcribing the content directly.""" # Removed trailing newline for consistency
 
             # --- Call Gemini API with Rate Limiting and Retry Logic ---
             app.logger.info(f"{log_prefix}: Preparing to call Gemini generate_content API (checking rate limit).")
