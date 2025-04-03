@@ -274,27 +274,7 @@ def process_pdf_chunk(chunk_path, task_id, chunk_index, total_chunks):
 
 
             # --- Enhanced Prompt ---
-            prompt = f"""Please perform Optical Character Recognition (OCR) and transcribe the content of the provided PDF document segment (Chunk {chunk_index + 1} of {total_chunks}).
-
-**Instructions:**
-1.  **Accuracy:** Transcribe the text as accurately as possible. Preserve original line breaks and paragraph structure where appropriate for readability.
-2.  **Corrupted Text:** If you encounter unclear or potentially corrupted words, try to reconstruct them based on the surrounding context. If reconstruction is not possible, indicate the unclear section clearly, e.g., using `[unclear word]` or `[illegible]`.
-3.  **Layout Elements to Exclude:** Explicitly **exclude** the transcription of complex visual elements such as:
-    * Images and photographs.
-    * Complex diagrams (flowcharts, graphs, technical drawings, etc.).
-    * Logos or decorative graphical elements.
-    * Handwritten signatures (unless clearly part of the main text).
-    * Page headers/footers that are purely navigational (like page numbers or repeating titles), unless they contain unique content relevant to the segment.
-4.  **Simple Tables:** If the segment contains simple tables (clear rows and columns with textual data):
-    * **Transcribe the textual content** of the table.
-    * **Format the output** to resemble a table structure using spaces for alignment. Ensure columns are reasonably separated. Do NOT use Markdown table syntax unless the original PDF used it. Example:
-        ```
-        Column A Header     Column B Header     Column C Header
-        Row 1 Data A        Row 1 Data B        Row 1 Data C
-        Row 2 Data A        Row 2 Data B        Row 2 Data C
-        ```
-    * If a table is too complex or heavily graphical, state `[Complex Table Skipped]` instead of attempting transcription.
-5.  **Output:** Return **only** the transcribed text based on these instructions. Do not include any introductory phrases like "Here is the transcription:" or summaries. Start directly with the transcribed content of the segment.
+            prompt = f""" TRANSCRIBE THE WHOLE PDF IN PROPER FORMATTED MANNER AND FILL IN THE CORRUPTED WORDS, IGNORE ALL TABLES JUST TRANSRIBE THE TEXT RELATED CONTENT AND FOR TABLES WITH SIMPLER DATA MAKE SURE TO ADJUST FOR PROPER SPACING SUCH THAT TOO LOOK LIKE A TABLE. MAKE SURE TO PROVIDE TEXT IN PROPER FORMATTED MANNER WITH APPROPRIATE SPACING WHEREVER NEEDED.
 """
 
             # --- Call Gemini API with Retry Logic ---
@@ -520,11 +500,11 @@ def process_uploaded_pdf(task_id, original_filepath, original_filename):
                     # Check if a result exists for this index (it might be missing if chunking failed for it)
                     if i in results:
                          outfile.write(results[i])
-                         outfile.write(f"\n\n--- End of Chunk {i+1} ---\n\n")
+                         outfile.write(f"                              ")
                     else:
                          # Indicate that this chunk was missing or failed during chunking/processing
-                         outfile.write(f"[Chunk {i+1} - Skipped or Failed]\n\n")
-                         outfile.write(f"--- End of Chunk {i+1} ---\n\n")
+                         outfile.write(f"Some Pages were failed! Sorry for the inconvenience caused, you can try again for proper transcription!")
+                         outfile.write(f"                              ")
 
             app.logger.info(f"{log_prefix}: Successfully compiled text to {output_filepath}")
         except IOError as e:
